@@ -1,0 +1,20 @@
+﻿# 本地密钥
+.env
+
+# 虚拟环境
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# 本地 IDE / 工具
+.claude/
+.idea/
+.vscode/
+
+# 每日生成的简报产物（本地保留即可）
+output/

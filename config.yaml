@@ -1,0 +1,39 @@
+﻿# RSS 新闻源列表（按领域覆盖）
+rss_feeds:
+  # 国内科技
+  - https://www.ithome.com/rss/
+  - https://36kr.com/feed
+  # 国际综合
+  - https://feeds.bbci.co.uk/news/rss.xml
+  - https://rss.nytimes.com/services/xml/rss/nyt/World.xml
+  # 国际科技
+  - https://techcrunch.com/feed/
+  - https://feeds.arstechnica.com/arstechnica/index
+  # 财经
+  - https://www.cnbc.com/id/100003114/device/rss/rss.html
+  - http://www.ftchinese.com/rss/feed
+
+# 每次最多抓取的文章数量
+max_articles: 5
+
+# LLM 厂商切换（密钥见 .env）
+# 改 provider 即可换厂商：agnes | deepseek
+llm:
+  provider: agnes
+  providers:
+    agnes:
+      model: "agnes-2.5-flash"
+      base_url: "https://apihub.agnes-ai.com/v1"
+      api_key_env: "AGNES_API_KEY"
+    deepseek:
+      model: "deepseek-chat"
+      base_url: "https://api.deepseek.com"
+      api_key_env: "DEEPSEEK_API_KEY"
+
+# 邮件非敏感配置（账号/密码见 .env）
+email:
+  subject: "📰 每日新闻简报"
+
+# 定时说明（实际由 Windows 任务计划程序控制：每天 08:00 / 18:00）
+schedule:
+  note: "DailyNewsEmail @ 08:00 & 18:00"
