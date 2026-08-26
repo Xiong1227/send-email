@@ -5,6 +5,7 @@
 """
 
 import os
+import re
 import sys
 import logging
 import feedparser
@@ -16,6 +17,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formatdate, make_msgid
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -30,13 +32,19 @@ with open(SCRIPT_DIR / "config.yaml", "r", encoding="utf-8") as f:
 
 log = logging.getLogger("daily_news")
 SCRAPE_FAIL_PLACEHOLDER = "[内容抓取失败，请点击原文链接查看]"
+TZ_CN = ZoneInfo("Asia/Shanghai")
+
+
+def now_cn() -> datetime:
+    """统一用北京时间，避免 GitHub Actions 运行机（UTC）把标题写成差 8 小时。"""
+    return datetime.now(TZ_CN)
 
 
 def setup_logging() -> Path:
     """同时输出到终端和 logs/ 文件。只用本模块的 logger，避免第三方库把正文打进日志。"""
     log_dir = SCRIPT_DIR / "logs"
     log_dir.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    stamp = now_cn().strftime("%Y-%m-%d_%H%M%S")
     log_path = log_dir / f"run_{stamp}.log"
 
     log.setLevel(logging.INFO)
@@ -257,6 +265,7 @@ SYSTEM_PROMPT = """你是一个专业的新闻编辑。用户会给你一批新�
 - 每篇文章的原文链接必须出现在「参考链接」板块
 - 信息量不足的类别可以省略，不要强行凑数
 - 语言简洁客观，不写评论性语句
+- 「整理时间」必须使用用户消息里给出的北京时间，不要自己编造或换算时区
 """
 
 
@@ -276,6 +285,10 @@ def ai_classify(articles, contents):
 ══════════════════════════════════════
 """
 
+    now = now_cn()
+    now_str = now.strftime("%Y-%m-%d %H:%M")
+    today_str = now.strftime("%Y-%m-%d")
+
     llm = get_llm_config()
     log.info(
         f"🤖 正在调用 {llm['name']} ({llm['model']}) 进行全局分类整理..."
@@ -287,15 +300,68 @@ def ai_classify(articles, contents):
         model=llm["model"],
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"请对以下 {len(articles)} 篇新闻进行统一分类整理，生成新闻简报：\n\n{combined}"},
+            {
+                "role": "user",
+                "content": (
+                    f"当前北京时间：{now_str}\n"
+                    f"标题请写成「# {today_str} 热点资讯」。\n"
+                    f"整理时间必须原样写成：{now_str}\n\n"
+                    f"请对以下 {len(articles)} 篇新闻进行统一分类整理，生成新闻简报：\n\n"
+                    f"{combined}"
+                ),
+            },
         ],
         temperature=0.7,
         max_tokens=8000,
     )
 
     result = response.choices[0].message.content or ""
+    result = _force_briefing_time(result, today_str, now_str)
+    result = _inject_word_count(result)
     log.info(f"✅ AI 整理完成（provider={llm['name']}，输出约 {len(result)} 字，内容不写入日志）")
     return result
+
+
+def _force_briefing_time(md_text: str, today_str: str, now_str: str) -> str:
+    """避免模型把整理时间写成 UTC 或随便填一个整点。"""
+    md_text = re.sub(
+        r"(整理时间[：:]\s*)([^\n]+)",
+        rf"\g<1>{now_str}",
+        md_text,
+        count=1,
+    )
+    md_text = re.sub(
+        r"^#\s+\d{4}-\d{2}-\d{2}\s+热点资讯",
+        f"# {today_str} 热点资讯",
+        md_text,
+        count=1,
+        flags=re.M,
+    )
+    return md_text
+
+
+def _plain_char_count(md_text: str) -> int:
+    """统计阅读用字数：去掉链接地址和标记符号，按可见文字计数。"""
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", md_text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"[#>*`|_\-\[\]()]+", "", text)
+    text = re.sub(r"\s+", "", text)
+    return len(text)
+
+
+def _inject_word_count(md_text: str) -> str:
+    """在整理时间下方插入篇幅，方便打开邮件前感知阅读量。"""
+    chars = _plain_char_count(md_text)
+    minutes = max(1, round(chars / 400))
+    line = f"> 📝 篇幅：约 {chars} 字 · 阅读约 {minutes} 分钟"
+    if re.search(r"整理时间", md_text):
+        return re.sub(
+            r"(整理时间[：:][^\n]+\n)",
+            rf"\1{line}\n",
+            md_text,
+            count=1,
+        )
+    return line + "\n\n" + md_text
 
 
 # ==================== 第4步：Markdown → HTML ====================
@@ -405,7 +471,7 @@ def markdown_to_html(md_text):
 {html_body}
 </div>
 <div class="footer">
-  📬 本简报由 AI 自动生成 · {datetime.now().strftime('%Y-%m-%d %H:%M')} · 仅供参考不构成任何建议
+  📬 本简报由 AI 自动生成 · {now_cn().strftime('%Y-%m-%d %H:%M')} · 仅供参考不构成任何建议
 </div>
 </body>
 </html>
@@ -444,7 +510,7 @@ def send_email(html_content):
     password = require_env("EMAIL_PASSWORD")
     smtp_host = os.getenv("SMTP_HOST", "").strip() or "smtp.qq.com"
     smtp_port = int(os.getenv("SMTP_PORT", "").strip() or "587")
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = now_cn().strftime("%Y-%m-%d %H:%M")
 
     msg = MIMEMultipart("alternative")
     msg["From"] = from_email
@@ -500,7 +566,7 @@ def run():
     contents = scrape_all(articles)
     markdown_result = ai_classify(articles, contents)
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = now_cn().strftime("%Y-%m-%d")
     output_dir = SCRIPT_DIR / "output"
     output_dir.mkdir(exist_ok=True)
 
@@ -521,7 +587,7 @@ def run():
 def main():
     log_path = setup_logging()
     log.info("=" * 60)
-    log.info(f"📰 每日新闻简报 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"📰 每日新闻简报 — {now_cn().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info(f"📄 日志文件: {log_path}")
     log.info("=" * 60)
     try:
