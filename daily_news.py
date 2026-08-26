@@ -5,6 +5,8 @@
 """
 
 import os
+import sys
+import logging
 import feedparser
 import requests
 from bs4 import BeautifulSoup
@@ -12,6 +14,7 @@ import yaml
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import formatdate, make_msgid
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -24,6 +27,41 @@ load_dotenv(SCRIPT_DIR / ".env")
 
 with open(SCRIPT_DIR / "config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
+
+log = logging.getLogger("daily_news")
+SCRAPE_FAIL_PLACEHOLDER = "[内容抓取失败，请点击原文链接查看]"
+
+
+def setup_logging() -> Path:
+    """同时输出到终端和 logs/ 文件。只用本模块的 logger，避免第三方库把正文打进日志。"""
+    log_dir = SCRIPT_DIR / "logs"
+    log_dir.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    log_path = log_dir / f"run_{stamp}.log"
+
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    log.propagate = False
+
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+
+    log.addHandler(file_handler)
+    log.addHandler(console_handler)
+    return log_path
 
 
 def require_env(name: str) -> str:
@@ -67,16 +105,26 @@ def fetch_rss():
     """抓取所有RSS源的文章元数据"""
     articles = []
     for feed_url in config["rss_feeds"]:
-        print(f"📡 抓取 RSS: {feed_url}")
-        feed = feedparser.parse(feed_url)
-        for entry in feed.entries[: config["max_articles"]]:
+        log.info(f"📡 抓取 RSS: {feed_url}")
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as e:
+            log.warning(f"   RSS 请求失败，跳过该源: {feed_url} — {e}")
+            continue
+
+        if getattr(feed, "bozo", False) and feed.bozo_exception:
+            log.warning(f"   RSS 解析异常，已尽量继续: {feed_url} — {feed.bozo_exception}")
+
+        taken = feed.entries[: config["max_articles"]]
+        log.info(f"   本源入选 {len(taken)} 篇")
+        for entry in taken:
             articles.append({
                 "title": entry.get("title", "无标题"),
                 "link": entry.get("link", ""),
                 "published": entry.get("published", ""),
                 "source": feed.feed.get("title", feed_url),
             })
-    print(f"✅ 共抓取 {len(articles)} 篇文章")
+    log.info(f"✅ 共抓取 {len(articles)} 篇文章（仅记录标题与链接，不记录正文）")
     return articles
 
 
@@ -102,17 +150,22 @@ def scrape_article(url, timeout=15):
         lines = [line.strip() for line in text.split("\n") if line.strip()]
         return "\n".join(lines)[:3000]  # 每篇文章最多3000字
     except Exception as e:
-        print(f"⚠️ 抓取失败，使用摘要代替: {url} — {e}")
-        return "[内容抓取失败，请点击原文链接查看]"
+        log.warning(f"⚠️ 抓取失败，使用摘要代替: {url} — {e}")
+        return SCRAPE_FAIL_PLACEHOLDER
 
 
 def scrape_all(articles):
-    """批量抓取网页内容"""
+    """批量抓取网页内容（正文只用于后续整理，不写入日志）"""
     content_list = []
     for i, article in enumerate(articles):
-        print(f"🔍 [{i+1}/{len(articles)}] 抓取: {article['title'][:50]}...")
+        log.info(f"🔍 [{i+1}/{len(articles)}] 抓取: {article['title'][:50]}...")
         content = scrape_article(article["link"])
+        if content != SCRAPE_FAIL_PLACEHOLDER:
+            log.info(f"   抓取成功（约 {len(content)} 字，正文不写入日志）")
         content_list.append(content)
+
+    failed = sum(1 for c in content_list if c == SCRAPE_FAIL_PLACEHOLDER)
+    log.info(f"✅ 正文抓取完成：成功 {len(content_list) - failed}，失败 {failed}")
     return content_list
 
 
@@ -224,9 +277,9 @@ def ai_classify(articles, contents):
 """
 
     llm = get_llm_config()
-    print(
+    log.info(
         f"🤖 正在调用 {llm['name']} ({llm['model']}) 进行全局分类整理..."
-        f"（共 {len(articles)} 篇文章）"
+        f"（共 {len(articles)} 篇文章；提示词与正文不写入日志）"
     )
 
     client = create_llm_client(llm)
@@ -240,8 +293,8 @@ def ai_classify(articles, contents):
         max_tokens=8000,
     )
 
-    result = response.choices[0].message.content
-    print(f"✅ AI 整理完成（provider={llm['name']}）")
+    result = response.choices[0].message.content or ""
+    log.info(f"✅ AI 整理完成（provider={llm['name']}，输出约 {len(result)} 字，内容不写入日志）")
     return result
 
 
@@ -362,73 +415,123 @@ def markdown_to_html(md_text):
 
 # ==================== 第5步：发送邮件 ====================
 
+SMTP_TIMEOUT_SEC = 20
+
+
+def _smtp_send(host, port, mode, from_email, password, to_email, raw_message):
+    """mode: ssl（465）或 starttls（587）。"""
+    if mode == "ssl":
+        with smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT_SEC) as server:
+            server.login(from_email, password)
+            server.sendmail(from_email, to_email, raw_message)
+        return
+    with smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT_SEC) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(from_email, password)
+        server.sendmail(from_email, to_email, raw_message)
+
+
 def send_email(html_content):
-    """通过 SMTP 发送 HTML 邮件（账号密码从 .env 读取）"""
+    """通过 SMTP 发送 HTML 邮件（账号密码从 .env 读取）。
+
+    部分网络上 QQ 的 465/SSL 会握手超时，这时自动改走 587/STARTTLS。
+    """
     email_cfg = config["email"]
     from_email = require_env("EMAIL_FROM")
     to_email = require_env("EMAIL_TO")
     password = require_env("EMAIL_PASSWORD")
-    smtp_host = os.getenv("SMTP_HOST", "smtp.qq.com").strip()
-    smtp_port = int(os.getenv("SMTP_PORT", "465").strip())
+    smtp_host = os.getenv("SMTP_HOST", "").strip() or "smtp.qq.com"
+    smtp_port = int(os.getenv("SMTP_PORT", "").strip() or "587")
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     msg = MIMEMultipart("alternative")
     msg["From"] = from_email
     msg["To"] = to_email
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
     msg["Subject"] = f'{email_cfg["subject"]} — {now_str}'
     msg.attach(MIMEText(html_content, "html", "utf-8"))
+    raw_message = msg.as_string()
 
-    try:
-        print(f"📧 发送邮件: {from_email} → {to_email}")
-        with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
-            server.login(from_email, password)
-            server.sendmail(from_email, to_email, msg.as_string())
-        print("✅ 邮件发送成功！")
-    except Exception as e:
-        print(f"❌ 邮件发送失败: {e}")
-        raise
+    if smtp_port == 465:
+        attempts = [(465, "ssl"), (587, "starttls")]
+    elif smtp_port == 587:
+        attempts = [(587, "starttls"), (465, "ssl")]
+    else:
+        attempts = [(smtp_port, "starttls")]
+
+    last_error = None
+    for port, mode in attempts:
+        try:
+            log.info(f"📧 发送邮件: {from_email} → {to_email}（{smtp_host}:{port} / {mode}）")
+            _smtp_send(smtp_host, port, mode, from_email, password, to_email, raw_message)
+            log.info("✅ 邮件发送成功！")
+            return
+        except Exception as e:
+            last_error = e
+            log.warning(f"   {smtp_host}:{port} 失败，尝试备用方式: {e}")
+
+    log.error(f"❌ 邮件发送失败: {last_error}")
+    raise last_error
+
+
+def resend_latest():
+    """只重发最近一份已生成的 HTML，不再抓取、不再调用模型。"""
+    output_dir = SCRIPT_DIR / "output"
+    htmls = sorted(output_dir.glob("news_*.html"))
+    if not htmls:
+        raise RuntimeError("output/ 下没有可重发的 HTML，请先完整跑一次")
+    latest = htmls[-1]
+    log.info(f"📤 仅重发已有简报: {latest}")
+    send_email(latest.read_text(encoding="utf-8"))
 
 
 # ==================== 主流程 ====================
 
-def main():
-    print("=" * 60)
-    print(f"📰 每日新闻简报 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
-
-    # 1. 抓 RSS
+def run():
+    """一次完整的抓取 → 整理 → 发信。"""
     articles = fetch_rss()
     if not articles:
-        print("❌ 没有抓取到任何文章，退出")
+        log.error("❌ 没有抓取到任何文章，退出")
         return
 
-    # 2. 抓取网页内容
     contents = scrape_all(articles)
-
-    # 3. AI 统一分类整理（所有文章一次性处理）
     markdown_result = ai_classify(articles, contents)
 
-    # 4. 保存 Markdown 原始结果
     today_str = datetime.now().strftime("%Y-%m-%d")
     output_dir = SCRIPT_DIR / "output"
     output_dir.mkdir(exist_ok=True)
 
     md_path = output_dir / f"news_{today_str}.md"
     md_path.write_text(markdown_result, encoding="utf-8")
-    print(f"💾 Markdown 已保存: {md_path}")
+    log.info(f"💾 Markdown 已保存: {md_path}")
 
-    # 5. 转换为 HTML 邮件
     html_content = markdown_to_html(markdown_result)
-
     html_path = output_dir / f"news_{today_str}.html"
     html_path.write_text(html_content, encoding="utf-8")
-    print(f"💾 HTML 已保存: {html_path}")
+    log.info(f"💾 HTML 已保存: {html_path}")
 
-    # 6. 发送邮件
     send_email(html_content)
+    log.info("=" * 60)
+    log.info("🎉 完成！")
 
-    print("=" * 60)
-    print("🎉 完成！")
+
+def main():
+    log_path = setup_logging()
+    log.info("=" * 60)
+    log.info(f"📰 每日新闻简报 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"📄 日志文件: {log_path}")
+    log.info("=" * 60)
+    try:
+        if "--resend" in sys.argv:
+            resend_latest()
+        else:
+            run()
+    except Exception:
+        log.exception("❌ 运行失败")
+        raise
 
 
 if __name__ == "__main__":

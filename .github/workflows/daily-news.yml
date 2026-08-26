@@ -1,0 +1,53 @@
+# 用 GitHub 托管的临时环境定时跑脚本，不是自租云服务器。
+# 时刻为 UTC：00:00 = 北京时间 08:00，10:00 = 北京时间 18:00。
+name: Daily News Email
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily news
+        env:
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python daily_news.py
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload briefing
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: output
+          path: output/
+          if-no-files-found: ignore
+          retention-days: 14
