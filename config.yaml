@@ -34,31 +34,6 @@ llm:
 email:
   subject: "📰 每日新闻简报"
 
-# 简报筛选与时效
-# weight_keywords 不是搜索过滤器：源里的新闻仍会全部抓取并进入快讯。
-# 这些词只给标题加分，命中的更容易出现在「30秒速览」和「深度精选」。
-# 想更关注某类话题，把词换成自己的即可，例如：房价、新能源、半导体。
-briefing:
-  fresh_hours: 12
-  min_fresh_articles: 5
-  weight_keywords:
-    - 突破
-    - 首次
-    - 历史新高
-    - 首发
-    - 制裁
-    - 关税
-    - 加息
-    - 降息
-    - 裁员
-    - 收购
-    - 上市
-    - 暴跌
-    - 暴涨
-    - 监管
-    - 芯片
-    - AI
-
-# 定时说明（实际由 Windows 任务计划程序 / GitHub Actions 控制）
+# 定时说明（实际由 Windows 任务计划程序控制：每天 08:00 / 18:00）
 schedule:
   note: "DailyNewsEmail @ 08:00 & 18:00"

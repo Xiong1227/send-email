@@ -15,8 +15,8 @@ import yaml
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from email.utils import formatdate, make_msgid, parsedate_to_datetime
-from datetime import datetime, timezone
+from email.utils import formatdate, make_msgid
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from dotenv import load_dotenv
@@ -109,94 +109,8 @@ def create_llm_client(llm):
 
 # ==================== 第1步：抓取RSS ====================
 
-def _briefing_cfg():
-    return config.get("briefing") or {}
-
-
-def parse_published(entry, published_str):
-    """把 RSS 时间转成北京时间。解析失败返回 None。"""
-    parsed = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
-    if parsed:
-        try:
-            return datetime(*parsed[:6], tzinfo=timezone.utc).astimezone(TZ_CN)
-        except Exception:
-            pass
-    if published_str:
-        try:
-            dt = parsedate_to_datetime(published_str)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(TZ_CN)
-        except Exception:
-            pass
-    return None
-
-
-def freshness_label(published_dt, now):
-    """给人看的时效：3小时前 / 2天前。"""
-    if published_dt is None:
-        return "时间未知"
-    seconds = (now - published_dt).total_seconds()
-    if seconds < 0:
-        return "刚刚"
-    if seconds < 3600:
-        return f"{max(1, int(seconds // 60))}分钟前"
-    if seconds < 86400:
-        return f"{int(seconds // 3600)}小时前"
-    return f"{int(seconds // 86400)}天前"
-
-
-def score_article(article):
-    """关键词 + 新鲜度打分，用于选出速览和精选。"""
-    title = article.get("title") or ""
-    score = 0
-    for kw in _briefing_cfg().get("weight_keywords") or []:
-        if kw and kw.lower() in title.lower():
-            score += 2
-    hours = article.get("hours_ago")
-    if hours is not None:
-        if hours <= 6:
-            score += 3
-        elif hours <= 12:
-            score += 2
-        elif hours <= 24:
-            score += 1
-        else:
-            score -= 1
-    if re.search(r"\d", title):
-        score += 1
-    return score
-
-
-def enrich_articles(articles):
-    """补上时效、权重，并按分数排序（高价值在前）。"""
-    now = now_cn()
-    fresh_hours = float(_briefing_cfg().get("fresh_hours") or 12)
-    for article in articles:
-        published_dt = article.get("published_dt")
-        article["freshness"] = freshness_label(published_dt, now)
-        if published_dt is None:
-            article["hours_ago"] = None
-            article["is_fresh"] = False
-        else:
-            hours = (now - published_dt).total_seconds() / 3600
-            article["hours_ago"] = hours
-            article["is_fresh"] = 0 <= hours <= fresh_hours
-        article["score"] = score_article(article)
-
-    articles.sort(key=lambda a: a.get("score", 0), reverse=True)
-    fresh_count = sum(1 for a in articles if a.get("is_fresh"))
-    min_fresh = int(_briefing_cfg().get("min_fresh_articles") or 5)
-    low_activity = fresh_count < min_fresh
-    log.info(
-        f"📊 时效：过去 {int(fresh_hours)} 小时内新鲜 {fresh_count}/{len(articles)} 篇"
-        f"{'（低活跃）' if low_activity else ''}"
-    )
-    return articles, low_activity, fresh_count
-
-
 def fetch_rss():
-    """抓取所有RSS源的文章元数据；缺标题或链接的条目直接跳过。"""
+    """抓取所有RSS源的文章元数据"""
     articles = []
     for feed_url in config["rss_feeds"]:
         log.info(f"📡 抓取 RSS: {feed_url}")
@@ -209,23 +123,15 @@ def fetch_rss():
         if getattr(feed, "bozo", False) and feed.bozo_exception:
             log.warning(f"   RSS 解析异常，已尽量继续: {feed_url} — {feed.bozo_exception}")
 
-        taken = 0
-        for entry in feed.entries[: config["max_articles"]]:
-            title = (entry.get("title") or "").strip() or "无标题"
-            link = (entry.get("link") or "").strip()
-            if title == "无标题" or not link:
-                log.warning("   跳过无标题或无链接的条目")
-                continue
-            published_str = entry.get("published") or entry.get("updated") or ""
+        taken = feed.entries[: config["max_articles"]]
+        log.info(f"   本源入选 {len(taken)} 篇")
+        for entry in taken:
             articles.append({
-                "title": title,
-                "link": link,
-                "published": published_str,
-                "published_dt": parse_published(entry, published_str),
+                "title": entry.get("title", "无标题"),
+                "link": entry.get("link", ""),
+                "published": entry.get("published", ""),
                 "source": feed.feed.get("title", feed_url),
             })
-            taken += 1
-        log.info(f"   本源入选 {taken} 篇")
     log.info(f"✅ 共抓取 {len(articles)} 篇文章（仅记录标题与链接，不记录正文）")
     return articles
 
@@ -273,81 +179,107 @@ def scrape_all(articles):
 
 # ==================== 第3步：AI 统一分类整理 ====================
 
-SYSTEM_PROMPT = """你是一个专业的新闻编辑。用户会给你一批新闻（标题、链接、时效、权重分、正文）。
+SYSTEM_PROMPT = """你是一个专业的新闻编辑。用户会给你一批新闻文章的列表（标题 + 正文内容）。
 
-按「速览 → 精选 → 快讯」三层输出一份简报，让人可以 30 秒扫完，也可以往下细读。
+你的任务是对这些新闻进行**全局统一分类**，并生成一份排版精美的新闻简报。
 
-## 分层规则
-1. **📌 30秒速览**：只放 3 条「今日必知」。优先用用户给出的高权重、较新的条目。每条一行，带时效。
-2. **📊 今日关键数据**：从正文里抽出最多 3 个变化最明显的数字，放在速览正下方（不要放到文末）。
-3. **🔥 深度精选**：只展开 2～3 条最重要的，用表格写 2～3 句摘要。不要把所有新闻都写成详版。
-4. **⚡ 快讯速览**：其余全部压成「一句话」。标题做成 Markdown 链接，不要在正文里堆裸 URL。
-5. **🔗 参考来源**：文末只保留一句说明「点击标题可打开原文」，不要再列一长串链接。
-6. **标签**：只放在全文最后一行，不要出现在标题下方。
+## 分类规则
+先把所有新闻通读一遍，再按以下类别归类：
+- 🌍 国际
+- 🇨🇳 国内
+- 🤖 科技 & AI
+- 📈 市场
+- ⚖️ 政策 & 监管
 
-时效必须使用用户提供的「3小时前 / 2天前」原文，禁止自己编时间或换算时区。
-整理时间必须使用用户给出的北京时间。
-标题必须做成 [标题](链接)，方便点进原文。
-不要用分类（国际/国内/科技）当一级结构；分类如需出现，写在快讯那一行的末尾括号里即可。
-语言简洁客观，不写评论。没有某类内容就省略，不要凑数。
-若用户标明「低活跃」，在元信息里保留该提示，不要假装资讯很多。
+如果某条新闻不属于以上类别但值得关注，归入「💡 其他」。
 
-## 输出格式（严格遵守）
+## 输出格式要求（严格遵守）
 
-```
-# YYYY-MM-DD 热点简报
+### 板块标题格式
+每个板块用 `## 🌍 国际 · 关键词` 格式，竖线后面是该板块的1-3个核心关键词。
 
-> 📅 整理时间：YYYY-MM-DD HH:MM
-> 📡 来源：RSS 聚合公开报道
+### 板块摘要
+每个 H2 板块标题下方紧跟一个 `> **一句话要点**：` 引用块，用一句话概括本板块的核心看点。
 
-## 📌 30秒速览
+### 内容表格
+板块摘要下方用表格呈现每条新闻：
 
-- **[3小时前]** [小米折叠屏将首发新芯片](https://example.com)：9 月上市，主打轻薄。
-- **[1小时前]** [美 30 年期国债收益率创阶段新高](https://example.com)：突破 **5.31%**。
-- **[5小时前]** [加拿大宣布对美商品加征关税](https://example.com)：涉及约 **200 亿美元**。
+| 焦点 | 摘要 |
+|------|------|
+| **事件标题** | 2-3句话概述，包含关键数字/人名/地名/时间节点。数字用 **粗体** 突出。 |
 
-## 📊 今日关键数据
+### 今日数据
+所有板块之后加 `## 📌 今日数据`，用表格列出本期关键数字：
 
 | 指标 | 数值 |
 |------|------|
-| 美 30 年期国债 | **5.31%** ↑ |
-| 布伦特原油 | **86.26 美元** ↓ |
+| 关键数字1 | 数值及含义 |
 
-## 🔥 深度精选
+### 参考链接
+最后加 `## 🔗 参考链接`，列出所有引用的来源链接：
 
-| 时效 | 焦点 | 摘要 |
-|------|------|------|
-| 3小时前 | **[事件标题](URL)** | 2-3句话，含关键数字/人名/地点。数字用 **粗体**。 |
-| 1小时前 | **[事件标题](URL)** | …… |
+- [来源名：文章标题](URL)
 
-## ⚡ 快讯速览
+### 标签行
+文末固定一行：`#热点 #每日资讯 #国际 #国内 #科技 #市场`
 
-- **[2小时前]** [标题](URL)：一句话摘要
-- **[1天前]** [标题](URL)：一句话摘要
+## 格式示例
 
-## 🔗 参考来源
+```
+# YYYY-MM-DD 热点资讯
 
-点击上方标题即可打开原文。
+> 📅 整理时间：YYYY-MM-DD HH:MM
+> 📡 来源：RSS 聚合公开报道
+> 🏷️ 标签：#热点 #每日资讯
+
+## 🌍 国际 · 美伊谈判 + 油价
+
+> **一句话要点**：美伊技术谈判将于近期恢复，国际油价大幅回落。
+
+| 焦点 | 摘要 |
+|------|------|
+| **美伊技术谈判将恢复** | 美国国务卿鲁比奥表示，美伊技术团队将于6月30日在瑞士继续会谈，由核能、解除制裁等领域专家组成的多个工作组将展开磋商。 |
+| **国际油价跌破战前水平** | 布伦特原油跌破每桶 **76美元** 关口，回落至伊朗战争爆发前水平；WTI原油收于 **70.34美元/桶**，跌3.92%。 |
+
+## 📌 今日数据
+
+| 指标 | 数值 |
+|------|------|
+| 布伦特原油 | **73.74美元/桶**（-4.33%） |
+| 关键数字2 | 数值及含义 |
+
+## 🔗 参考链接
+
+- [来源名：文章标题](https://...)
+- [来源名：文章标题](https://...)
 
 #热点 #每日资讯 #国际 #国内 #科技 #市场
 ```
+
+## 重要提醒
+- 同一类别的新闻必须合并到同一个 ## 标题下，用表格呈现
+- 不要用 ### 三级标题逐条列出新闻
+- 表格中「焦点」列放加粗的事件标题，「摘要」列放2-3句概述
+- 关键数字用 **粗体** 突出（金额、百分比、时间、伤亡等）
+- 如果某个类别没有新闻，就不要写那个类别
+- 每篇文章的原文链接必须出现在「参考链接」板块
+- 信息量不足的类别可以省略，不要强行凑数
+- 语言简洁客观，不写评论性语句
+- 「整理时间」必须使用用户消息里给出的北京时间，不要自己编造或换算时区
 """
 
 
-def ai_classify(articles, contents, low_activity=False, fresh_count=0):
-    """把所有文章内容合并，一次性发给 AI 做分层整理。"""
+def ai_classify(articles, contents):
+    """把所有文章内容合并，一次性发给 AI 做全局分类"""
+    # 拼接所有文章
     combined = ""
     for i, (article, content) in enumerate(zip(articles, contents)):
         combined += f"""
 ══════════════════════════════════════
 【文章 {i+1}】
 标题：{article['title']}
-链接：{article['link']}
-来源站点：{article.get('source') or ''}
-发布时间原文：{article.get('published') or ''}
-时效：{article.get('freshness') or '时间未知'}
-权重分：{article.get('score', 0)}
-是否12小时内：{'是' if article.get('is_fresh') else '否'}
+来源：{article['link']}
+发布时间：{article['published']}
 正文：
 {content}
 ══════════════════════════════════════
@@ -356,16 +288,11 @@ def ai_classify(articles, contents, low_activity=False, fresh_count=0):
     now = now_cn()
     now_str = now.strftime("%Y-%m-%d %H:%M")
     today_str = now.strftime("%Y-%m-%d")
-    activity_line = (
-        f"低活跃：是（过去12小时内仅 {fresh_count} 篇新鲜资讯，不要假装内容很多）"
-        if low_activity
-        else f"低活跃：否（过去12小时内新鲜 {fresh_count} 篇）"
-    )
 
     llm = get_llm_config()
     log.info(
-        f"🤖 正在调用 {llm['name']} ({llm['model']}) 进行分层整理..."
-        f"（共 {len(articles)} 篇；提示词与正文不写入日志）"
+        f"🤖 正在调用 {llm['name']} ({llm['model']}) 进行全局分类整理..."
+        f"（共 {len(articles)} 篇文章；提示词与正文不写入日志）"
     )
 
     client = create_llm_client(llm)
@@ -377,11 +304,9 @@ def ai_classify(articles, contents, low_activity=False, fresh_count=0):
                 "role": "user",
                 "content": (
                     f"当前北京时间：{now_str}\n"
-                    f"标题请写成「# {today_str} 热点简报」。\n"
-                    f"整理时间必须原样写成：{now_str}\n"
-                    f"{activity_line}\n"
-                    f"每条新闻展示时必须带上给定的「时效」，不要改写。\n"
-                    f"请对以下 {len(articles)} 篇新闻生成三层简报：\n\n"
+                    f"标题请写成「# {today_str} 热点资讯」。\n"
+                    f"整理时间必须原样写成：{now_str}\n\n"
+                    f"请对以下 {len(articles)} 篇新闻进行统一分类整理，生成新闻简报：\n\n"
                     f"{combined}"
                 ),
             },
@@ -393,7 +318,6 @@ def ai_classify(articles, contents, low_activity=False, fresh_count=0):
     result = response.choices[0].message.content or ""
     result = _force_briefing_time(result, today_str, now_str)
     result = _inject_word_count(result)
-    result = _inject_freshness_note(result, low_activity, fresh_count, len(articles))
     log.info(f"✅ AI 整理完成（provider={llm['name']}，输出约 {len(result)} 字，内容不写入日志）")
     return result
 
@@ -407,8 +331,8 @@ def _force_briefing_time(md_text: str, today_str: str, now_str: str) -> str:
         count=1,
     )
     md_text = re.sub(
-        r"^#\s+\d{4}-\d{2}-\d{2}\s+热点(资讯|简报)",
-        f"# {today_str} 热点简报",
+        r"^#\s+\d{4}-\d{2}-\d{2}\s+热点资讯",
+        f"# {today_str} 热点资讯",
         md_text,
         count=1,
         flags=re.M,
@@ -433,26 +357,6 @@ def _inject_word_count(md_text: str) -> str:
     if re.search(r"整理时间", md_text):
         return re.sub(
             r"(整理时间[：:][^\n]+\n)",
-            rf"\1{line}\n",
-            md_text,
-            count=1,
-        )
-    return line + "\n\n" + md_text
-
-
-def _inject_freshness_note(md_text: str, low_activity: bool, fresh_count: int, total: int) -> str:
-    """在篇幅下方标明新鲜资讯占比；过少时标低活跃。"""
-    hours = int(_briefing_cfg().get("fresh_hours") or 12)
-    if low_activity:
-        line = (
-            f"> ⚠️ 低活跃：过去 {hours} 小时内仅 {fresh_count}/{total} 篇，"
-            "以下可能含较早报道"
-        )
-    else:
-        line = f"> ⏱️ 时效：过去 {hours} 小时内新鲜 {fresh_count}/{total} 篇"
-    if re.search(r"篇幅：", md_text):
-        return re.sub(
-            r"(篇幅：[^\n]+\n)",
             rf"\1{line}\n",
             md_text,
             count=1,
@@ -595,7 +499,7 @@ def _smtp_send(host, port, mode, from_email, password, to_email, raw_message):
         server.sendmail(from_email, to_email, raw_message)
 
 
-def send_email(html_content, subject_extra=""):
+def send_email(html_content):
     """通过 SMTP 发送 HTML 邮件（账号密码从 .env 读取）。
 
     部分网络上 QQ 的 465/SSL 会握手超时，这时自动改走 587/STARTTLS。
@@ -607,16 +511,13 @@ def send_email(html_content, subject_extra=""):
     smtp_host = os.getenv("SMTP_HOST", "").strip() or "smtp.qq.com"
     smtp_port = int(os.getenv("SMTP_PORT", "").strip() or "587")
     now_str = now_cn().strftime("%Y-%m-%d %H:%M")
-    subject = email_cfg["subject"]
-    if subject_extra:
-        subject = f"{subject} {subject_extra}"
 
     msg = MIMEMultipart("alternative")
     msg["From"] = from_email
     msg["To"] = to_email
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
-    msg["Subject"] = f"{subject} — {now_str}"
+    msg["Subject"] = f'{email_cfg["subject"]} — {now_str}'
     msg.attach(MIMEText(html_content, "html", "utf-8"))
     raw_message = msg.as_string()
 
@@ -662,11 +563,8 @@ def run():
         log.error("❌ 没有抓取到任何文章，退出")
         return
 
-    articles, low_activity, fresh_count = enrich_articles(articles)
     contents = scrape_all(articles)
-    markdown_result = ai_classify(
-        articles, contents, low_activity=low_activity, fresh_count=fresh_count
-    )
+    markdown_result = ai_classify(articles, contents)
 
     today_str = now_cn().strftime("%Y-%m-%d")
     output_dir = SCRIPT_DIR / "output"
@@ -681,8 +579,7 @@ def run():
     html_path.write_text(html_content, encoding="utf-8")
     log.info(f"💾 HTML 已保存: {html_path}")
 
-    extra = "[低活跃]" if low_activity else ""
-    send_email(html_content, subject_extra=extra)
+    send_email(html_content)
     log.info("=" * 60)
     log.info("🎉 完成！")
 
