@@ -2,7 +2,7 @@
 rss_feeds:
   # 国内科技
   - https://www.ithome.com/rss/
-  - https://36kr.com/feed
+  - https://www.36kr.com/feed
   # 国际综合
   - https://feeds.bbci.co.uk/news/rss.xml
   - https://rss.nytimes.com/services/xml/rss/nyt/World.xml
@@ -11,10 +11,18 @@ rss_feeds:
   - https://feeds.arstechnica.com/arstechnica/index
   # 财经
   - https://www.cnbc.com/id/100003114/device/rss/rss.html
-  - http://www.ftchinese.com/rss/feed
+  - https://www.ftchinese.com/rss/feed
 
 # 每次最多抓取的文章数量
 max_articles: 5
+
+# 并行抓取（都是等网络，不是占 CPU）
+# articles=6：大约 6 路同时抓正文，40 篇从「排队十几分钟」压到一两分钟量级
+# per_host=2：同一网站同时最多 2 篇，减轻 429 / 被掐连接
+concurrency:
+  rss_feeds: 4
+  articles: 6
+  per_host: 2
 
 # LLM 厂商切换（密钥见 .env）
 # 改 provider 即可换厂商：agnes | deepseek
@@ -34,6 +42,6 @@ llm:
 email:
   subject: "📰 每日新闻简报"
 
-# 定时说明（实际由 Windows 任务计划程序控制：每天 08:00 / 18:00）
+# 定时说明（GitHub Actions：北京 07:40 / 18:40 开工，目标约 08:00 / 19:00 送达）
 schedule:
-  note: "DailyNewsEmail @ 08:00 & 18:00"
+  note: "DailyNewsEmail @ 07:40 & 18:40 (Beijing start)"
