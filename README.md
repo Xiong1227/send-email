@@ -46,7 +46,8 @@
 说明：
 
 - `.env` **不要**提交到 Git。云上靠 Secrets 注入同名环境变量，脚本读法与本地相同。
-- 定时可能晚几分钟。公开仓库若长期无提交，GitHub 可能暂停定时；私有仓库一般更稳定。
+- 工作流按 UTC 写的 `00:00` / `10:00`，对应北京时间 08:00 / 18:00。GitHub 的定时**可能推迟几分钟到数小时**，不是脚本把时区写错了。
+- 改了代码或 `requirements.txt` 后必须 `git push`。Actions 每次都是重新克隆仓库再 `pip install -r requirements.txt`，本机新装的包不会自动出现在云上。
 - Actions 运行机多在海外，部分国内 RSS 可能抓不到，正文失败时仍会带上标题和链接。
 - 邮件标题和「整理时间」按**北京时间**显示。
 
@@ -205,7 +206,7 @@ python setup_schedule.py
 
 ## 依赖
 
-见 `requirements.txt`：`feedparser`、`openai`、`requests`、`beautifulsoup4`、`pyyaml`、`markdown`、`python-dotenv`。
+见 `requirements.txt`：`feedparser`、`openai`、`requests`、`beautifulsoup4`、`pyyaml`、`markdown`、`python-dotenv`、`tzdata`（Windows 上 `ZoneInfo` 需要它）。
 
 ## 注意事项
 

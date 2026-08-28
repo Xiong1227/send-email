@@ -15,7 +15,7 @@ import yaml
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from email.utils import formatdate, make_msgid
+from email.utils import format_datetime, make_msgid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -32,6 +32,9 @@ with open(SCRIPT_DIR / "config.yaml", "r", encoding="utf-8") as f:
 
 log = logging.getLogger("daily_news")
 SCRAPE_FAIL_PLACEHOLDER = "[内容抓取失败，请点击原文链接查看]"
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
 TZ_CN = ZoneInfo("Asia/Shanghai")
 
 
@@ -110,12 +113,14 @@ def create_llm_client(llm):
 # ==================== 第1步：抓取RSS ====================
 
 def fetch_rss():
-    """抓取所有RSS源的文章元数据"""
+    """抓取所有RSS源的文章元数据。先用 requests 限时下载，避免 feedparser 直接访问时卡死。"""
     articles = []
     for feed_url in config["rss_feeds"]:
         log.info(f"📡 抓取 RSS: {feed_url}")
         try:
-            feed = feedparser.parse(feed_url)
+            resp = requests.get(feed_url, headers=HTTP_HEADERS, timeout=15)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
         except Exception as e:
             log.warning(f"   RSS 请求失败，跳过该源: {feed_url} — {e}")
             continue
@@ -140,11 +145,8 @@ def fetch_rss():
 
 def scrape_article(url, timeout=15):
     """抓取单篇文章的文本内容（替代 FireCrawl）"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
     try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -266,6 +268,7 @@ SYSTEM_PROMPT = """你是一个专业的新闻编辑。用户会给你一批新�
 - 信息量不足的类别可以省略，不要强行凑数
 - 语言简洁客观，不写评论性语句
 - 「整理时间」必须使用用户消息里给出的北京时间，不要自己编造或换算时区
+- 直接输出 Markdown 正文，不要用 ```markdown 代码块包住全文
 """
 
 
@@ -366,13 +369,24 @@ def _inject_word_count(md_text: str) -> str:
 
 # ==================== 第4步：Markdown → HTML ====================
 
+def _unwrap_markdown_fence(md_text: str) -> str:
+    """模型偶尔用 ``` 包住全文，转 HTML 后会变成代码块，QQ 里就像没排版。"""
+    text = (md_text or "").strip()
+    if not text.startswith("```"):
+        return text
+    text = re.sub(r"^```(?:markdown|md)?\s*\n", "", text, count=1, flags=re.I)
+    text = re.sub(r"\n```\s*$", "", text)
+    return text.strip()
+
+
 def markdown_to_html(md_text):
     """将 Markdown 转为适合邮件的 HTML"""
     import markdown
 
+    md_text = _unwrap_markdown_fence(md_text)
     html_body = markdown.markdown(
         md_text,
-        extensions=["extra", "codehilite", "nl2br"],
+        extensions=["extra", "tables", "nl2br", "sane_lists"],
     )
 
     # 嵌入美观的邮件样式
@@ -515,9 +529,10 @@ def send_email(html_content):
     msg = MIMEMultipart("alternative")
     msg["From"] = from_email
     msg["To"] = to_email
-    msg["Date"] = formatdate(localtime=True)
+    msg["Date"] = format_datetime(now_cn())
     msg["Message-ID"] = make_msgid()
     msg["Subject"] = f'{email_cfg["subject"]} — {now_str}'
+    msg.attach(MIMEText("请使用支持 HTML 的邮箱查看每日新闻简报。", "plain", "utf-8"))
     msg.attach(MIMEText(html_content, "html", "utf-8"))
     raw_message = msg.as_string()
 
@@ -587,7 +602,7 @@ def run():
 def main():
     log_path = setup_logging()
     log.info("=" * 60)
-    log.info(f"📰 每日新闻简报 — {now_cn().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"📰 每日新闻简报 — {now_cn().strftime('%Y-%m-%d %H:%M:%S')}（北京时间）")
     log.info(f"📄 日志文件: {log_path}")
     log.info("=" * 60)
     try:
