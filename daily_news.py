@@ -1,9 +1,10 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 每日新闻简报自动化脚本
 流程：RSS抓取 → 网页抓取内容 → 合并 → AI统一分类整理 → 生成HTML邮件 → 发送
 """
 
+import argparse
 import os
 import re
 import sys
@@ -13,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock, Semaphore
 from urllib.parse import urlparse
 import feedparser
+import httpx
+import markdown
 import requests
 from bs4 import BeautifulSoup
 import yaml
@@ -25,7 +28,6 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
-import httpx
 
 # ==================== 加载配置 ====================
 
@@ -550,8 +552,6 @@ def _inline_email_styles(html_body: str) -> str:
 
 def markdown_to_html(md_text):
     """将 Markdown 转为适合邮件的 HTML"""
-    import markdown
-
     md_text = _unwrap_markdown_fence(md_text)
     html_body = markdown.markdown(
         md_text,
@@ -740,6 +740,23 @@ def resend_latest():
     send_email(latest.read_text(encoding="utf-8"))
 
 
+def check_setup() -> None:
+    """不抓取、不调模型、不发信：只确认依赖导入与关键环境变量是否齐全。"""
+    log.info("🔎 自检：依赖与配置（不会发信）")
+    log.info(f"   Python: {sys.version.split()[0]} @ {sys.executable}")
+    log.info(f"   httpx: {httpx.__version__}")
+    log.info(f"   openai SDK 已导入；RSS 源数量: {len(config.get('rss_feeds') or [])}")
+
+    llm = get_llm_config()
+    log.info(f"   LLM: provider={llm['name']} model={llm['model']}")
+    for name in ("EMAIL_FROM", "EMAIL_TO", "EMAIL_PASSWORD"):
+        require_env(name)
+    smtp_host = os.getenv("SMTP_HOST", "").strip() or "smtp.qq.com"
+    smtp_port = os.getenv("SMTP_PORT", "").strip() or "587"
+    log.info(f"   SMTP: {smtp_host}:{smtp_port}（账号已配置，不打印密钥）")
+    log.info("✅ 自检通过。完整跑一次请去掉 --check；仅重发用 --resend。")
+
+
 # ==================== 主流程 ====================
 
 def run():
@@ -770,14 +787,33 @@ def run():
     log.info("🎉 完成！")
 
 
-def main():
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="每日新闻简报：RSS → LLM → 邮件")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help="只检查依赖与环境变量，不抓取、不调模型、不发信",
+    )
+    mode.add_argument(
+        "--resend",
+        action="store_true",
+        help="只重发 output/ 里最近一份 HTML，不再抓取、不再调用模型",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None):
+    args = parse_args(argv)
     log_path = setup_logging()
     log.info("=" * 60)
     log.info(f"📰 每日新闻简报 — {now_cn().strftime('%Y-%m-%d %H:%M:%S')}（北京时间）")
     log.info(f"📄 日志文件: {log_path}")
     log.info("=" * 60)
     try:
-        if "--resend" in sys.argv:
+        if args.check:
+            check_setup()
+        elif args.resend:
             resend_latest()
         else:
             run()

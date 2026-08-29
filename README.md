@@ -108,6 +108,12 @@ Windows 也可双击 `run.bat`。脚本会自动切到自身所在目录；若�
 python daily_news.py --resend
 ```
 
+只检查依赖与环境变量是否齐全（不抓取、不调模型、不发信），适合改完 `requirements.txt` 或 Secrets 后快速验证：
+
+```bash
+python daily_news.py --check
+```
+
 ## 配置说明
 
 敏感信息放 `.env`（本地）或 Actions Secrets（云端），其余放 `config.yaml`。不要把 `.env` 提交到 Git。
@@ -206,7 +212,7 @@ python setup_schedule.py
 
 ## 依赖
 
-见 `requirements.txt`：`feedparser`、`openai`、`requests`、`beautifulsoup4`、`pyyaml`、`markdown`、`python-dotenv`、`tzdata`（Windows 上 `ZoneInfo` 需要它）。
+见 `requirements.txt`：`feedparser`、`openai`（锁定 `<3`，避免 3.x 改用 `httpx2`）、`httpx`（脚本直接使用）、`requests`、`beautifulsoup4`、`pyyaml`、`markdown`、`python-dotenv`、`tzdata`（Windows 上 `ZoneInfo` 需要它）。直接 `import` 的包都应写进清单，不要只靠别的库「顺带装上」。
 
 ## 注意事项
 

@@ -1,5 +1,7 @@
 ﻿feedparser>=6.0.0
-openai>=1.0.0
+# openai 3.x 改依赖 httpx2，与本脚本的 import httpx / Timeout 不兼容；锁在 2.x
+openai>=1.0.0,<3
+httpx>=0.27.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 pyyaml>=6.0
